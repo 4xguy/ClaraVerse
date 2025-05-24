@@ -14,6 +14,7 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
+    "start": "vite preview --port $PORT --host 0.0.0.0",
     "test": "npx vitest run",
     "test:watch": "npx vitest",
     "test:ui": "npx vitest --ui",
