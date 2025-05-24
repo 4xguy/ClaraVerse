@@ -11,9 +11,16 @@ class PythonApi {
     this.requestQueue = [];
     this.maxRetries = 3;
     this.currentRetry = 0;
+    this.isWebDeployment = !window.electron;
     
-    // Initialize the API client
-    this.init();
+    // Skip initialization for web deployments
+    if (!this.isWebDeployment) {
+      // Initialize the API client only for Electron
+      this.init();
+    } else {
+      console.log('Running in web mode - Python backend disabled');
+      this.initialized = false;
+    }
     
     // Listen for backend status updates from Electron
     if (window.electron) {
@@ -103,6 +110,12 @@ class PythonApi {
    * Detect backend port by probing common ports
    */
   async detectPortByProbing() {
+    // Skip port detection for web deployments
+    if (this.isWebDeployment) {
+      console.log('Web deployment - skipping backend port detection');
+      throw new Error('Python backend not available in web deployment');
+    }
+    
     console.log('Detecting backend port by probing...');
     
     // Try common ports in our range
@@ -145,6 +158,11 @@ class PythonApi {
    * Schedule a reconnection attempt
    */
   scheduleReconnect(delay = 5000) {
+    // Skip reconnection for web deployments
+    if (this.isWebDeployment) {
+      return;
+    }
+    
     if (this.retryTimeout) clearTimeout(this.retryTimeout);
     
     this.retryTimeout = setTimeout(() => {
@@ -175,6 +193,11 @@ class PythonApi {
    * Ensure the client is initialized before making requests
    */
   async ensureInitialized() {
+    // For web deployments, throw a more descriptive error
+    if (this.isWebDeployment) {
+      throw new Error('Python backend is not available in web deployment. Please use the desktop version for full functionality.');
+    }
+    
     if (!this.initialized) {
       await this.init();
       if (!this.initialized) {
