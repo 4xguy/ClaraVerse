@@ -4,6 +4,17 @@ uvicorn
 python-multipart  # For file uploads
 pydantic # Using 1.x for better compatibility
 
+# Database
+psycopg2-binary
+pgvector
+sqlalchemy
+alembic
+
+# Authentication
+python-jose[cryptography]
+passlib[bcrypt]
+python-dotenv
+
 # LangChain and related
 langchain
 langchain-community

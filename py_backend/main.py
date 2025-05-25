@@ -3,7 +3,6 @@ import sys
 import socket
 import logging
 import signal
-import sqlite3
 import traceback
 import time
 import argparse
@@ -28,6 +27,12 @@ from langchain_community.document_loaders import TextLoader  # Fixed import
 
 # Import Speech2Text
 from Speech2Text import Speech2Text
+
+# Import auth and database routes
+from routes.auth_routes import router as auth_router
+from routes.db_routes import router as db_router
+from routes.vector_routes import router as vector_router
+from db.database import get_db
 
 # Configure logging
 logging.basicConfig(
@@ -62,6 +67,11 @@ try:
 except Exception as e:
     logger.warning(f"Diffusers API not loaded: {e}")
 
+# Include auth and database routers
+app.include_router(auth_router, prefix="/auth", tags=["authentication"])
+app.include_router(db_router, prefix="/db", tags=["database"])
+app.include_router(vector_router, prefix="/vector", tags=["vector"])
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -85,119 +95,9 @@ async def catch_exceptions_middleware(request: Request, call_next):
             content={"error": str(e), "detail": traceback.format_exc()}
         )
 
-# Database path in user's home directory for persistence
-home_dir = os.path.expanduser("~")
-data_dir = os.path.join(home_dir, ".clara")
-os.makedirs(data_dir, exist_ok=True)
-DATABASE = os.path.join(data_dir, "clara.db")
-
-# Maximum number of retries for database operations
-MAX_RETRIES = 3
-RETRY_DELAY = 0.1  # seconds
-
-@contextmanager
-def get_db_connection(timeout=20):
-    """Context manager for database connections with retry logic"""
-    conn = None
-    retries = 0
-    last_error = None
-    
-    while retries < MAX_RETRIES:
-        try:
-            conn = sqlite3.connect(DATABASE, timeout=timeout)
-            conn.row_factory = sqlite3.Row
-            # Enable WAL mode for better concurrency
-            conn.execute('PRAGMA journal_mode=WAL')
-            # Set busy timeout
-            conn.execute(f'PRAGMA busy_timeout={timeout * 1000}')
-            yield conn
-            return
-        except sqlite3.Error as e:
-            last_error = e
-            if conn:
-                try:
-                    conn.close()
-                except:
-                    pass
-            retries += 1
-            if retries < MAX_RETRIES:
-                time.sleep(RETRY_DELAY * (2 ** retries))  # Exponential backoff
-            logger.warning(f"Database retry {retries}/{MAX_RETRIES}: {str(e)}")
-    
-    logger.error(f"Database error after {MAX_RETRIES} retries: {last_error}")
-    raise HTTPException(
-        status_code=500,
-        detail=f"Database error: {str(last_error)}"
-    )
-
-def init_db():
-    """Initialize the database with tables"""
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            # Create test table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS test (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    value TEXT
-                )
-            """)
-            
-            # Create documents table to track uploaded files
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS documents (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    filename TEXT,
-                    file_type TEXT,
-                    collection_name TEXT,
-                    metadata TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Create collections table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS collections (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT UNIQUE,
-                    description TEXT,
-                    document_count INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Create document_chunks table to track individual chunks from a document
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS document_chunks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    document_id INTEGER,
-                    chunk_id TEXT,
-                    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
-                )
-            """)
-            
-            # Create clara-assistant collection if it doesn't exist
-            cursor.execute("""
-                INSERT OR IGNORE INTO collections (name, description)
-                VALUES ('clara-assistant', 'Default collection for Clara Assistant')
-            """)
-            
-            # Check if test data exists
-            cursor.execute("SELECT COUNT(*) FROM test")
-            count = cursor.fetchone()[0]
-            if count == 0:
-                cursor.execute("INSERT INTO test (value) VALUES ('Hello from SQLite')")
-            
-            conn.commit()
-                
-        logger.info("Database initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize database: {e}")
-        logger.error(traceback.format_exc())
-        raise
-
-# Initialize the database
-init_db()
+# Note: Database initialization is now handled by PostgreSQL
+# The tables are created via SQL scripts in docker/postgres/init/
+# No need for SQLite initialization anymore
 
 # Create a persistent directory for vector databases
 vectordb_dir = os.path.join(os.path.expanduser("~"), ".clara", "vectordb")
@@ -281,14 +181,14 @@ def read_root():
     }
 
 @app.get("/test")
-def read_test():
+def read_test(db=Depends(get_db)):
     """Test endpoint that returns data from the database"""
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, value FROM test LIMIT 1")
-            row = cursor.fetchone()
-            
+        cursor = db.cursor()
+        # Test with a simple query
+        cursor.execute("SELECT 1 as id, 'Hello from PostgreSQL' as value")
+        row = cursor.fetchone()
+        
         if row:
             return JSONResponse(content={"id": row[0], "value": row[1], "port": PORT})
         return JSONResponse(content={"error": "No data found", "port": PORT})
@@ -307,47 +207,49 @@ def health_check():
 
 # Document management endpoints
 @app.post("/collections")
-async def create_collection(collection: CollectionCreate):
+async def create_collection(collection: CollectionCreate, db=Depends(get_db)):
     """Create a new collection"""
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            
-            # First check if collection exists
-            cursor.execute(
-                "SELECT name FROM collections WHERE name = ?",
-                (collection.name,)
+        cursor = db.cursor()
+        
+        # First check if collection exists
+        cursor.execute(
+            "SELECT name FROM collections WHERE name = %s",
+            (collection.name,)
+        )
+        existing = cursor.fetchone()
+        
+        if existing:
+            return JSONResponse(
+                status_code=409,
+                content={"detail": f"Collection '{collection.name}' already exists"}
             )
-            existing = cursor.fetchone()
-            
-            if existing:
+        
+        # Create the collection
+        try:
+            cursor.execute(
+                """
+                INSERT INTO collections (name, description)
+                VALUES (%s, %s)
+                """,
+                (collection.name, collection.description or "")
+            )
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            # Handle race condition where collection was created between our check and insert
+            if "duplicate key" in str(e).lower():
                 return JSONResponse(
                     status_code=409,
                     content={"detail": f"Collection '{collection.name}' already exists"}
                 )
-            
-            # Create the collection
-            try:
-                cursor.execute(
-                    """
-                    INSERT INTO collections (name, description)
-                    VALUES (?, ?)
-                    """,
-                    (collection.name, collection.description or "")
-                )
-                conn.commit()
-            except sqlite3.IntegrityError:
-                # Handle race condition where collection was created between our check and insert
-                return JSONResponse(
-                    status_code=409,
-                    content={"detail": f"Collection '{collection.name}' already exists"}
-                )
-            
-            # Initialize vector store for the collection
-            get_doc_ai(collection.name)
-            
-            return {"message": f"Collection '{collection.name}' created successfully"}
-            
+            raise
+        
+        # Initialize vector store for the collection
+        get_doc_ai(collection.name)
+        
+        return {"message": f"Collection '{collection.name}' created successfully"}
+        
     except Exception as e:
         logger.error(f"Error creating collection: {e}")
         logger.error(traceback.format_exc())
@@ -357,47 +259,46 @@ async def create_collection(collection: CollectionCreate):
         )
 
 @app.get("/collections")
-def list_collections():
+def list_collections(db=Depends(get_db)):
     """List all available document collections"""
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT name, description, document_count, created_at FROM collections")
-            collections = [dict(row) for row in cursor.fetchall()]
-            return {"collections": collections}
+        cursor = db.cursor()
+        cursor.execute("SELECT name, description, document_count, created_at FROM collections")
+        columns = [desc[0] for desc in cursor.description]
+        collections = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        return {"collections": collections}
     except Exception as e:
         logger.error(f"Error listing collections: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/collections/{collection_name}")
-async def delete_collection(collection_name: str):
+async def delete_collection(collection_name: str, db=Depends(get_db)):
     """Delete a collection and all its documents"""
     try:
         # Delete from vector store first
         doc_ai = get_doc_ai(collection_name)
         
         # Get all document chunks for this collection
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT dc.chunk_id
-                FROM document_chunks dc
-                JOIN documents d ON d.id = dc.document_id
-                WHERE d.collection_name = ?
-            """, (collection_name,))
-            chunk_ids = [row[0] for row in cursor.fetchall()]
-            
-            if chunk_ids:
-                # Delete chunks from vector store
-                doc_ai.delete_documents(chunk_ids)
-            
-            # Delete all documents and chunks from SQLite
-            cursor.execute("DELETE FROM documents WHERE collection_name = ?", (collection_name,))
-            
-            # Delete collection record
-            cursor.execute("DELETE FROM collections WHERE name = ?", (collection_name,))
-            conn.commit()
-            
+        cursor = db.cursor()
+        cursor.execute("""
+            SELECT dc.chunk_id
+            FROM document_chunks dc
+            JOIN documents d ON d.id = dc.document_id
+            WHERE d.collection_name = %s
+        """, (collection_name,))
+        chunk_ids = [row[0] for row in cursor.fetchall()]
+        
+        if chunk_ids:
+            # Delete chunks from vector store
+            doc_ai.delete_documents(chunk_ids)
+        
+        # Delete all documents and chunks from PostgreSQL
+        cursor.execute("DELETE FROM documents WHERE collection_name = %s", (collection_name,))
+        
+        # Delete collection record
+        cursor.execute("DELETE FROM collections WHERE name = %s", (collection_name,))
+        db.commit()
+        
         # Remove from cache to force recreation
         if collection_name in doc_ai_cache:
             del doc_ai_cache[collection_name]
@@ -410,7 +311,7 @@ async def delete_collection(collection_name: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/collections/recreate")
-async def recreate_collection(collection_name: str = "default_collection"):
+async def recreate_collection(collection_name: str = "default_collection", db=Depends(get_db)):
     """Recreate a collection by deleting and reinitializing it"""
     try:
         # Get persist directory path
@@ -432,13 +333,12 @@ async def recreate_collection(collection_name: str = "default_collection"):
                 # Even if directory deletion fails, continue with recreation
 
         # Delete all documents from the database
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            # Delete all documents and chunks from SQLite
-            cursor.execute("DELETE FROM document_chunks WHERE document_id IN (SELECT id FROM documents WHERE collection_name = ?)", (collection_name,))
-            cursor.execute("DELETE FROM documents WHERE collection_name = ?", (collection_name,))
-            cursor.execute("DELETE FROM collections WHERE name = ?", (collection_name,))
-            conn.commit()
+        cursor = db.cursor()
+        # Delete all documents and chunks from PostgreSQL
+        cursor.execute("DELETE FROM document_chunks WHERE document_id IN (SELECT id FROM documents WHERE collection_name = %s)", (collection_name,))
+        cursor.execute("DELETE FROM documents WHERE collection_name = %s", (collection_name,))
+        cursor.execute("DELETE FROM collections WHERE name = %s", (collection_name,))
+        db.commit()
 
         # Create directory for new collection
         os.makedirs(persist_dir, exist_ok=True)
@@ -453,13 +353,11 @@ async def recreate_collection(collection_name: str = "default_collection"):
         doc_ai_cache[collection_name] = doc_ai
         
         # Create new collection record
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO collections (name, description) VALUES (?, ?)",
-                (collection_name, f"Recreated collection {collection_name}")
-            )
-            conn.commit()
+        cursor.execute(
+            "INSERT INTO collections (name, description) VALUES (%s, %s)",
+            (collection_name, f"Recreated collection {collection_name}")
+        )
+        db.commit()
         
         return {
             "message": f"Collection {collection_name} recreated successfully",
@@ -475,20 +373,20 @@ async def recreate_collection(collection_name: str = "default_collection"):
 async def upload_document(
     file: UploadFile = File(...),
     collection_name: str = Form("default_collection"),
-    metadata: str = Form("{}")
+    metadata: str = Form("{}"),
+    db=Depends(get_db)
 ):
     """Upload a document file (PDF, CSV, or plain text) and add it to the vector store"""
     # Check if collection exists, create if not
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM collections WHERE name = ?", (collection_name,))
-            if not cursor.fetchone():
-                cursor.execute(
-                    "INSERT INTO collections (name, description) VALUES (?, ?)",
-                    (collection_name, f"Auto-created for {file.filename}")
-                )
-                conn.commit()
+        cursor = db.cursor()
+        cursor.execute("SELECT name FROM collections WHERE name = %s", (collection_name,))
+        if not cursor.fetchone():
+            cursor.execute(
+                "INSERT INTO collections (name, description) VALUES (%s, %s)",
+                (collection_name, f"Auto-created for {file.filename}")
+            )
+            db.commit()
     except Exception as e:
         logger.error(f"Error checking/creating collection: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -542,27 +440,26 @@ async def upload_document(
             doc_ids = doc_ai.add_documents(documents)
             
             # Update database
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
+            cursor = db.cursor()
+            cursor.execute(
+                "INSERT INTO documents (filename, file_type, collection_name, metadata) VALUES (%s, %s, %s, %s) RETURNING id",
+                (file.filename, file_type, collection_name, metadata)
+            )
+            document_id = cursor.fetchone()[0]
+            
+            # Store the relationship between document and its chunks
+            for chunk_id in doc_ids:
                 cursor.execute(
-                    "INSERT INTO documents (filename, file_type, collection_name, metadata) VALUES (?, ?, ?, ?)",
-                    (file.filename, file_type, collection_name, metadata)
+                    "INSERT INTO document_chunks (document_id, chunk_id) VALUES (%s, %s)",
+                    (document_id, chunk_id)
                 )
-                document_id = cursor.lastrowid
-                
-                # Store the relationship between document and its chunks
-                for chunk_id in doc_ids:
-                    cursor.execute(
-                        "INSERT INTO document_chunks (document_id, chunk_id) VALUES (?, ?)",
-                        (document_id, chunk_id)
-                    )
-                
-                # Update document count in collection
-                cursor.execute(
-                    "UPDATE collections SET document_count = document_count + ? WHERE name = ?",
-                    (1, collection_name)  # Only count the original document, not chunks
-                )
-                conn.commit()
+            
+            # Update document count in collection
+            cursor.execute(
+                "UPDATE collections SET document_count = document_count + %s WHERE name = %s",
+                (1, collection_name)  # Only count the original document, not chunks
+            )
+            db.commit()
             
             return {
                 "status": "success",
@@ -580,86 +477,85 @@ async def upload_document(
             raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
 
 @app.get("/documents")
-async def list_documents(collection_name: Optional[str] = None):
+async def list_documents(collection_name: Optional[str] = None, db=Depends(get_db)):
     """List all documents, optionally filtered by collection"""
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
+        cursor = db.cursor()
+        
+        query = """
+            SELECT d.id, d.filename, d.file_type, d.collection_name, d.metadata, 
+                   d.created_at, COUNT(dc.id) as chunk_count 
+            FROM documents d
+            LEFT JOIN document_chunks dc ON d.id = dc.document_id
+        """
+        
+        params = []
+        if collection_name:
+            query += " WHERE d.collection_name = %s"
+            params.append(collection_name)
             
-            query = """
-                SELECT d.id, d.filename, d.file_type, d.collection_name, d.metadata, 
-                       d.created_at, COUNT(dc.id) as chunk_count 
-                FROM documents d
-                LEFT JOIN document_chunks dc ON d.id = dc.document_id
-            """
-            
-            params = []
-            if collection_name:
-                query += " WHERE d.collection_name = ?"
-                params.append(collection_name)
-                
-            query += " GROUP BY d.id"
-            
-            cursor.execute(query, params)
-            documents = [dict(row) for row in cursor.fetchall()]
-            
-            return {"documents": documents}
+        query += " GROUP BY d.id, d.filename, d.file_type, d.collection_name, d.metadata, d.created_at"
+        
+        cursor.execute(query, params)
+        columns = [desc[0] for desc in cursor.description]
+        documents = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        
+        return {"documents": documents}
     except Exception as e:
         logger.error(f"Error listing documents: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error listing documents: {str(e)}")
 
 @app.delete("/documents/{document_id}")
-async def delete_document(document_id: int):
+async def delete_document(document_id: int, db=Depends(get_db)):
     """Delete a document and all its chunks from the database and vector store"""
     try:
         # Get document details and chunk IDs
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT collection_name FROM documents WHERE id = ?", 
-                (document_id,)
-            )
-            document = cursor.fetchone()
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT collection_name FROM documents WHERE id = %s", 
+            (document_id,)
+        )
+        document = cursor.fetchone()
+        
+        if not document:
+            raise HTTPException(status_code=404, detail=f"Document with ID {document_id} not found")
             
-            if not document:
-                raise HTTPException(status_code=404, detail=f"Document with ID {document_id} not found")
-                
-            collection_name = document['collection_name']
-            
-            # Get all chunks related to this document
-            cursor.execute(
-                "SELECT chunk_id FROM document_chunks WHERE document_id = ?", 
-                (document_id,)
-            )
-            chunks = [row['chunk_id'] for row in cursor.fetchall()]
-            
-            # Get DocumentAI instance for this collection
-            doc_ai = get_doc_ai(collection_name)
-            
-            # Delete chunks from vector store
-            if chunks:
-                doc_ai.delete_documents(chunks)
-            
-            # Delete document chunks first (in case CASCADE doesn't work)
-            cursor.execute(
-                "DELETE FROM document_chunks WHERE document_id = ?", 
-                (document_id,)
-            )
-            
-            # Delete the document itself
-            cursor.execute(
-                "DELETE FROM documents WHERE id = ?", 
-                (document_id,)
-            )
-            
-            # Update document count in collection
-            cursor.execute(
-                "UPDATE collections SET document_count = document_count - 1 WHERE name = ? AND document_count > 0",
-                (collection_name,)
-            )
-            conn.commit()
-            
+        collection_name = document[0]
+        
+        # Get all chunks related to this document
+        cursor.execute(
+            "SELECT chunk_id FROM document_chunks WHERE document_id = %s", 
+            (document_id,)
+        )
+        chunks = [row[0] for row in cursor.fetchall()]
+        
+        # Get DocumentAI instance for this collection
+        doc_ai = get_doc_ai(collection_name)
+        
+        # Delete chunks from vector store
+        if chunks:
+            doc_ai.delete_documents(chunks)
+        
+        # Delete document chunks first (in case CASCADE doesn't work)
+        cursor.execute(
+            "DELETE FROM document_chunks WHERE document_id = %s", 
+            (document_id,)
+        )
+        
+        # Delete the document itself
+        cursor.execute(
+            "DELETE FROM documents WHERE id = %s", 
+            (document_id,)
+        )
+        
+        # Update document count in collection
+        cursor.execute(
+            "UPDATE collections SET document_count = document_count - 1 WHERE name = %s AND document_count > 0",
+            (collection_name,)
+        )
+        db.commit()
+        
         return {
             "status": "success", 
             "message": f"Document {document_id} and its {len(chunks)} chunks deleted"
