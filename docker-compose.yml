@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./py_backend
+      dockerfile: Dockerfile
+    environment:
+      - PORT=${BACKEND_PORT:-5000}
+      - HOST=0.0.0.0
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "${BACKEND_PORT:-5000}:${BACKEND_PORT:-5000}"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${BACKEND_PORT:-5000}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - clara-network
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=http://backend:${BACKEND_PORT:-5000}
+        - VITE_RAILWAY_BACKEND_URL=http://backend:${BACKEND_PORT:-5000}
+    environment:
+      - PORT=${PORT:-80}
+      - VITE_API_URL=http://backend:${BACKEND_PORT:-5000}
+    ports:
+      - "${PORT:-80}:${PORT:-80}"
+    depends_on:
+      - backend
+    networks:
+      - clara-network
+
+networks:
+  clara-network:
+    driver: bridge

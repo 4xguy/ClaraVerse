@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./py_backend
+      dockerfile: Dockerfile
+    environment:
+      - PORT # Railway will inject this
+      - HOST=0.0.0.0
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:$${PORT}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=$${RAILWAY_PRIVATE_DOMAIN}
+    environment:
+      - PORT # Railway will inject this
+      - VITE_API_URL=$${RAILWAY_PRIVATE_DOMAIN}
+    depends_on:
+      - backend
+    restart: unless-stopped

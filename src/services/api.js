@@ -1,3 +1,5 @@
+import { getApiBaseUrl, isBackendAvailable } from '../config/api.js';
+
 /**
  * API client for Python backend with auto-discovery and retry capabilities
  */
@@ -13,8 +15,14 @@ class PythonApi {
     this.currentRetry = 0;
     this.isWebDeployment = !window.electron;
     
-    // Skip initialization for web deployments
-    if (!this.isWebDeployment) {
+    // Check if backend is available
+    const backendUrl = getApiBaseUrl();
+    if (backendUrl) {
+      // Use configured backend URL
+      this.baseUrl = backendUrl;
+      this.initialized = true;
+      console.log('Using configured backend URL:', this.baseUrl);
+    } else if (!this.isWebDeployment) {
       // Initialize the API client only for Electron
       this.init();
     } else {
@@ -193,9 +201,9 @@ class PythonApi {
    * Ensure the client is initialized before making requests
    */
   async ensureInitialized() {
-    // For web deployments, throw a more descriptive error
-    if (this.isWebDeployment) {
-      throw new Error('Python backend is not available in web deployment. Please use the desktop version for full functionality.');
+    // Check if backend is configured
+    if (!isBackendAvailable()) {
+      throw new Error('Python backend is not available. Please use the desktop version for full functionality.');
     }
     
     if (!this.initialized) {

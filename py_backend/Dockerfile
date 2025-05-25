@@ -28,11 +28,14 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 # Copy application code
 COPY . .
 
+# Make start script executable
+RUN chmod +x start.sh
+
 # Create data directory
 RUN mkdir -p /app/data
 
 # Set environment variables
-ENV HOST="127.0.0.1" \
+ENV HOST="0.0.0.0" \
     PORT=5000 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -53,4 +56,4 @@ HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:${PORT}/health || exit 1
 
 # Run the application with environment variables
-CMD ["sh", "-c", "python main.py --host $HOST --port $PORT"] 
+CMD ["./start.sh"] 

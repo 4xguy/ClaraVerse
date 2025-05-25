@@ -5,6 +5,11 @@ COPY package*.json ./
 RUN npm install
 COPY . .
 COPY .env .env
+
+# Accept build args for API URL
+ARG VITE_API_URL
+ENV VITE_API_URL=$VITE_API_URL
+
 RUN npm run build
 
 FROM nginx:alpine
